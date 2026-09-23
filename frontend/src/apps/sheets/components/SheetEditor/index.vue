@@ -1741,112 +1741,117 @@ const isDirty = customRef((track, trigger) => {
 // onBeforeUnmount does NOT fire on a browser refresh (Vue never unmounts the
 // component), and keepalive fetches are capped at 64 KiB — far below a real
 // sheets_data payload — so the async save on unload cannot be relied on.
-// Instead we persist every keystroke synchronously to localStorage under a
-// per-sheet key. The draft is restored after loadSheet(), cleared per-cell
-// only after the server confirms the save, and cleared on Escape.
+// Instead we persist every keystroke synchronously to localStorage.
+//
+// Key layout:
+//   sheets:draft:<userId>:<sheetId>          — storage bucket, user-scoped
+//   cells["<subSheet>|<cellId>"]             — cell entries, sub-sheet-scoped
+//
+// Each entry stores `{ sheet, cell, value, base }`:
+//   * `value` is the pending edit.
+//   * `base` is the committed value the edit started from. On restore we
+//     refuse to apply a draft if the engine's current value has diverged
+//     from `base` — that means someone else committed a newer value in the
+//     meantime and overwriting it would lose data.
+//
+// The draft is restored after loadSheet() + syncNames(), cleared per-cell
+// on Escape / rejected commits, and cleared (only for entries the server
+// now matches) after a successful save. Cell values are NEVER logged.
 const DRAFT_KEY_PREFIX = 'sheets:draft:'
 
+// Entries are keyed by [sheet, cell] so A1 on two tabs never collides.
+const _draftEntryKey = (sn, cellId) => JSON.stringify([sn, cellId])
+
+// Scoped per user AND per sheet, so another account signing in on this
+// browser never sees (or applies) a previous account's unsaved content.
+// userEmail is declared further down; this only runs after setup.
 function _draftKey() {
-  return (props.id && props.id !== 'new') ? DRAFT_KEY_PREFIX + props.id : null
+  const user = userEmail.value
+  if (!user || !props.id || props.id === 'new') return null
+  return DRAFT_KEY_PREFIX + encodeURIComponent(user) + ':' + props.id
 }
 
-function _readDraft() {
+function _readDraftCells() {
   const key = _draftKey()
-  if (!key) return null
+  if (!key) return {}
   try {
-    const raw = window.localStorage?.getItem(key)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== 'object' || !parsed.cells) return null
-    return parsed
-  } catch { return null }
+    const parsed = JSON.parse(window.localStorage?.getItem(key))
+    return parsed && typeof parsed === 'object' && parsed.cells && typeof parsed.cells === 'object'
+      ? parsed.cells : {}
+  } catch { return {} }
 }
 
-function _writeDraft(draft) {
+function _writeDraftCells(cells) {
   const key = _draftKey()
   if (!key) return
   try {
-    if (!draft || !Object.keys(draft.cells || {}).length) {
-      window.localStorage.removeItem(key)
-    } else {
-      window.localStorage.setItem(key, JSON.stringify(draft))
-    }
+    if (!Object.keys(cells).length) window.localStorage.removeItem(key)
+    else window.localStorage.setItem(key, JSON.stringify({ cells, ts: Date.now() }))
   } catch { /* private mode / quota — never break editing for storage */ }
 }
 
-// Called from onInput / onFormulaInput on EVERY keystroke. Synchronous, so it
-// is already on disk before the user can reach for Cmd+R.
+// Called on EVERY keystroke. `base` is the committed value the edit started
+// from; restore uses it to refuse to overwrite newer data. While the engine
+// still differs from the draft (edit in progress) the original base is kept;
+// once the previous edit was committed, a new edit re-baselines.
+// Never logs cell contents.
 function _saveDraftCell(cellId, value, sheetName) {
-  if (!cellId) return
-  const key = _draftKey()
-  if (!key) return
-  const draft = _readDraft() || { cells: {}, ts: 0 }
-  draft.cells[cellId] = { value, sheet: sheetName || sheet.getCurrentSheet() }
-  draft.ts = Date.now()
-  _writeDraft(draft)
-  // eslint-disable-next-line no-console
-  console.log('[Sheets Draft] saved locally', {
-    sheet: props.id, cell: cellId, value, ts: draft.ts,
-  })
+  if (!cellId || !_draftKey() || readOnly.value) return
+  const sn        = sheetName || sheet.getCurrentSheet()
+  const cells     = _readDraftCells()
+  const k         = _draftEntryKey(sn, cellId)
+  const prev      = cells[k]
+  const committed = sheet.getCell(cellId, sn) ?? ''
+  const base      = prev && committed !== prev.value ? prev.base : committed
+  cells[k] = { sheet: sn, cell: cellId, value, base }
+  _writeDraftCells(cells)
 }
 
-// Escape / explicit cancel — the user has rejected the pending value, so the
-// draft must not resurrect it on the next load.
-function _clearDraftCell(cellId) {
+// Escape / rejected commit — the pending value must not resurrect on reload.
+function _clearDraftCell(cellId, sheetName) {
   if (!cellId) return
-  const draft = _readDraft()
-  if (!draft) return
-  delete draft.cells[cellId]
-  draft.ts = Date.now()
-  _writeDraft(draft)
+  const cells = _readDraftCells()
+  delete cells[_draftEntryKey(sheetName || sheet.getCurrentSheet(), cellId)]
+  _writeDraftCells(cells)
 }
 
-// Called only after a confirmed server save. We keep entries whose value
-// still disagrees with the engine (those are newer edits typed during the
-// in-flight request) so the "type-while-saving" case isn't dropped.
+// After a confirmed server save: drop entries the engine now matches, keep
+// newer keystrokes typed while the request was in flight.
 function _clearSavedDrafts() {
-  const draft = _readDraft()
-  if (!draft) return
   const remaining = {}
-  for (const [cellId, entry] of Object.entries(draft.cells)) {
-    const sn = entry.sheet || sheet.getCurrentSheet()
-    if (sheet.getCell(cellId, sn) !== entry.value) remaining[cellId] = entry
+  for (const [k, e] of Object.entries(_readDraftCells())) {
+    if (sheet.getCell(e.cell, e.sheet) !== e.value) remaining[k] = e
   }
-  _writeDraft({ cells: remaining, ts: Date.now() })
-  if (!Object.keys(remaining).length) {
-    // eslint-disable-next-line no-console
-    console.log('[Sheets Draft] cleared', { sheet: props.id })
-  } else {
-    // eslint-disable-next-line no-console
-    console.log('[Sheets Draft] server save success — kept newer entries', {
-      sheet: props.id, kept: Object.keys(remaining),
-    })
-  }
+  _writeDraftCells(remaining)
 }
 
-// Apply the draft to the sheet engine. Called from _loadInitialData AFTER
-// loadSheet() + syncNames() and BEFORE the user can interact.
+// Called from _loadInitialData AFTER loadSheet() + syncNames(). Skips (and
+// discards) drafts for read-only users, for data that changed since the edit
+// began, for protected cells, and for sheets that no longer exist.
 function _restoreDraft() {
-  const draft = _readDraft()
-  if (!draft || !Object.keys(draft.cells || {}).length) return 0
-  // eslint-disable-next-line no-console
-  console.log('[Sheets Draft] restoring', {
-    sheet: props.id, cells: Object.keys(draft.cells), ts: draft.ts,
-  })
+  // Pre-fix drafts were keyed by sheet id only and may hold another
+  // account's content — drop them unread.
+  if (props.id && props.id !== 'new') {
+    try { window.localStorage?.removeItem(DRAFT_KEY_PREFIX + props.id) } catch { /* ignore */ }
+  }
+  const cells = _readDraftCells()
+  if (!Object.keys(cells).length) return 0
+  if (readOnly.value) { _writeDraftCells({}); return 0 }
+  const kept = {}
   let restored = 0
-  for (const [cellId, entry] of Object.entries(draft.cells)) {
-    const sn = entry.sheet || sheet.getCurrentSheet()
-    if (sheet.getCell(cellId, sn) === entry.value) continue  // already matches
-    sheet.setCell(cellId, entry.value, sn)
+  for (const [k, e] of Object.entries(cells)) {
+    if (!e || typeof e.cell !== 'string' || !sheetNames.value.includes(e.sheet)) continue
+    const current = sheet.getCell(e.cell, e.sheet) ?? ''
+    if (current === e.value) continue                          // already saved
+    if (e.base !== undefined && current !== e.base) continue   // data moved on
+    if (_cellSilentlyProtected(e.cell, e.sheet)) continue
+    sheet.setCell(e.cell, e.value, e.sheet)
+    kept[k] = e   // stays until autosave confirms it via _clearSavedDrafts
     restored++
   }
-  if (restored > 0) {
-    // eslint-disable-next-line no-console
-    console.log('[Sheets Draft] restored', { sheet: props.id, count: restored })
-    // Flip dirty so the existing autosave watcher persists the recovered
-    // state on its own — no explicit _triggerAutoSave needed.
-    isDirty.value = true
-  }
+  _writeDraftCells(kept)
+  // Autosave persists the recovered state on its own.
+  if (restored > 0) isDirty.value = true
   return restored
 }
 // ── end Draft persistence ───────────────────────────────────────────────────
@@ -3318,6 +3323,7 @@ function _setupGridInstance() {
       // Protection first — blocks writes AND clears (empty value) on a locked
       // cell. Nothing was written, so repaint the pre-edit value and bail.
       if (_cellBlocked(id, writeSheet)) {
+        _clearDraftCell(id, writeSheet)
         grid?.render?.()
         editingHomeSheet.value = null
         editingHomeCell.value  = null
@@ -3336,6 +3342,7 @@ function _setupGridInstance() {
         // 'warn' rules let the value through but surface a transient notice;
         // 'reject' (default) blocks the edit and repaints the pre-edit value.
         if (!v.valid && v.severity !== 'warn') {
+          _clearDraftCell(id, writeSheet)
           const msg = v.message || 'Value rejected by data validation rule'
           saveError.value = msg
           setTimeout(() => { if (saveError.value === msg) saveError.value = '' }, 3500)
@@ -3395,8 +3402,10 @@ function _setupGridInstance() {
     onInput(id, value)  {
       // Draft persistence: mirror every keystroke into localStorage so a hard
       // refresh mid-edit recovers the value even though onCommit never fires.
+      // Cross-sheet edits write against the home sheet so a switch mid-edit
+      // still lands on the right cell after reload.
       formulaValue.value = value
-      _saveDraftCell(id, value, sheet.getCurrentSheet())
+      _saveDraftCell(id, value, editingHomeSheet.value || sheet.getCurrentSheet())
     },
     onCancel(id)        {
       const homeSheet = editingHomeSheet.value
@@ -3408,7 +3417,7 @@ function _setupGridInstance() {
       formulaValue.value = sheet.getCell(id)
       // Escape rejects the pending value — clear its draft so the reload
       // doesn't resurrect the edit the user explicitly cancelled.
-      _clearDraftCell(id)
+      _clearDraftCell(id, homeSheet || sheet.getCurrentSheet())
     },
     getFormat:    id => formats.get(id, sheet.getCurrentSheet()),
     // Lazy render value source (Phase 1, off by default). Mirrors exactly what
@@ -4097,6 +4106,7 @@ function _commitFormulaBar() {
   const targetId    = homeCell  || activeCell.value
   // Protected target — discard the edit and restore the bar to the cell value.
   if (_cellBlocked(targetId, targetSheet)) {
+    _clearDraftCell(targetId, targetSheet)
     editingHomeSheet.value = null
     editingHomeCell.value  = null
     formulaValue.value = sheet.getCell(targetId, targetSheet)
@@ -4130,7 +4140,10 @@ function _cancelFormulaBar() {
   }
   // Escape in the formula bar discards the pending edit — kill the draft for
   // whichever cell it was targeting so the reload doesn't resurrect it.
-  _clearDraftCell(homeCell || activeCell.value)
+  _clearDraftCell(
+    homeCell || activeCell.value,
+    homeSheet || sheet.getCurrentSheet(),
+  )
   editingHomeSheet.value = null
   editingHomeCell.value  = null
 }
